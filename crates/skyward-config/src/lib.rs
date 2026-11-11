@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(gatekeeper.ready_service.as_deref(), Some("android.hardware.gatekeeper.IGatekeeper/default"));
         assert_eq!(gatekeeper.description.as_deref(), Some("/vendor/etc/vintf/manifest_pineapple.xml"));
         let wlan = cfg.wlan.expect("the 14's WLAN is described");
-        assert_eq!(wlan.firmware[1].path, "/mnt/vendor/persist/wlan/wlan_mac.bin");
+        assert_eq!(wlan.firmware[1].path, "/mnt/vendor/persist/kiwi_v2/wlan_mac.bin");
         assert_eq!(wlan.modules, ["rfkill", "qca_cld3_kiwi_v2"]);
     }
 

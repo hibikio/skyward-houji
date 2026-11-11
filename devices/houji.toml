@@ -65,7 +65,7 @@ mounted = ["persist"]
 # the loader is told to search the folders the services name.
 [[service]]
 path = "/system/bin/sh"
-args = ["-c", "mkdir -p /kmlibs; cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/libnl.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/libdl_android.so /kmlibs/ 2>/dev/null; printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt; exit 0"]
+args = ["-c", "mkdir -p /kmlibs; cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/libnl.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ 2>/dev/null; cp /mnt/system/system/lib64/libdl_android.so /kmlibs/ 2>/dev/null; printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt; chmod 755 /kmlibs; chmod 644 /kmlibs/*; exit 0"]
 oneshot = true
 user = "root"
 groups = ["root"]
@@ -152,14 +152,16 @@ groups = ["root"]
 # the modem partition, which [firmware] mounts and shows at /firmware; the
 # settings and the MAC address the driver asks the firmware loader for are
 # copied to /etc/firmware from the vendor partition and from persist, where
-# the vendor's own links point. wpa_supplicant runs on the recovery's own
-# libraries before the vendor partition's, as on the 17 Ultra.
+# the vendor's own links point. The address is under kiwi_v2, the folder
+# the vendor's link leaves empty on this build. wpa_supplicant runs on the
+# recovery's own libraries before the vendor partition's, as on the 17
+# Ultra, and on the installed system's libnl, which a recovery leaves out.
 [wlan]
 modules = ["rfkill", "qca_cld3_kiwi_v2"]
 writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
 firmware = [
     { name = "wlan/qca_cld/kiwi_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/kiwi_v2/WCNSS_qcom_cfg.ini" },
-    { name = "wlan/qca_cld/kiwi_v2/wlan_mac.bin", path = "/mnt/vendor/persist/wlan/wlan_mac.bin" },
+    { name = "wlan/qca_cld/kiwi_v2/wlan_mac.bin", path = "/mnt/vendor/persist/kiwi_v2/wlan_mac.bin" },
 ]
 interface = "wlan0"
 supplicant = "/vendor/bin/hw/wpa_supplicant"
