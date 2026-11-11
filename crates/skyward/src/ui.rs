@@ -1111,6 +1111,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // and the users whose own files are still closed once it is open.
     let mut decryptor: Option<Decryptor> = None;
     let mut closed: Vec<Closed> = Vec::new();
+    let mut auto_unlock = app.state.saved_code.clone().filter(|_| app.state.auto_decrypt);
+    if auto_unlock.is_some() && matches!(app.state.data, Data::Closed) {
+        app.start_decrypt();
+        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+    }
     let mut arriving = Some(Incoming::Arrived);
     // The mount page shows the partitions as they are when it opens and
     // after each change; why they cannot be read is the page's to say.
@@ -1360,6 +1365,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         None => None,
     };
+    if app.state.auto_wlan {
+        if let Some(w) = &wlan {
+            w.send(wlan::Command::On);
+        }
+    }
+    let mut auto_join_tried = false;
     let mut scanned_at = Instant::now();
     app.state.update_server = cfg.update.is_some();
     // Asking the update server, and downloading the full package.
@@ -1917,6 +1928,31 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             }
             if let Some(t) = traffic {
                 app.set_traffic(t);
+            }
+        }
+        if app.state.auto_wlan && !auto_join_tried {
+            if let Some(w) = &app.state.wlan {
+                if w.power == WlanPower::On && w.joined.is_none() {
+                    auto_join_tried = true;
+                    if let Some(saved) = app.state.saved_wlan.clone() {
+                        app.state.pending_wlan = Some(saved.clone());
+                        wlan_worker(&wlan)?.send(wlan::Command::Join {
+                            ssid: saved.ssid,
+                            name: saved.name,
+                            security: saved.security,
+                            password: saved.password,
+                        });
+                    }
+                }
+            }
+        }
+        if decryptor.is_none() {
+            if let Some(code) = auto_unlock.clone() {
+                if let Data::Locked { user, .. } = app.state.data {
+                    auto_unlock = None;
+                    let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
+                    decryptor = Some(Decryptor::start(job)?);
+                }
             }
         }
         // The WLAN page scans again now and then while it shows, as the
@@ -2505,6 +2541,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     }
                     Effect::StopDownload => downloader.as_ref().context("there is no download to stop")?.stop(),
+                    Effect::DeleteDownloaded => {
+                        ensure!(downloader.is_none(), "the full package is being downloaded");
+                        let release = match &app.state.check {
+                            skyward_ui::app::Check::Answered(Some(release)) => release,
+                            _ => anyhow::bail!("the newest system is not known"),
+                        };
+                        let path = downloaded(release);
+                        for one in [path.clone(), download::partial(&path)] {
+                            match fs::remove_file(&one) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e).with_context(|| format!("delete {}", one.display())),
+                            }
+                        }
+                        skyward_sys::kmsg(&format!("deleted the downloaded package {}", path.display()))?;
+                        app.download_deleted();
+                    }
                     Effect::CheckSkyward => {
                         ensure!(skyward_checker.is_none(), "GitHub is being asked already");
                         let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();

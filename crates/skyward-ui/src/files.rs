@@ -207,10 +207,10 @@ fn middle(c: &Canvas, face: &Face, px: f32, text: &str, w: f32) -> String {
 /// The list's rows for `entries`, the first starting where an unscrolled
 /// page puts it, each touched for `action`; a row grows by a line for a
 /// name on two.
-pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Action) -> Rows {
+pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Action, head: f32) -> Rows {
     let m = &t.m;
     let w = name_width(t);
-    let mut y = m.dp(ROWS_TOP_DP).round();
+    let mut y = (m.dp(ROWS_TOP_DP) + head).round();
     let mut edges = Vec::with_capacity(entries.len() + 1);
     edges.push(y);
     for e in entries {
@@ -473,11 +473,11 @@ pub fn strip(t: &Theme, f: &Fonts, top: &str, folder: &str) -> Pinned {
 
 /// What the page says in place of the list, centred below the path, with
 /// the reason under it when there is one.
-pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, title: &str, why: Option<&str>) {
+pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, title: &str, why: Option<&str>, head: f32) {
     let m = &t.m;
     let p = palette(t);
     let cx = m.w as f32 / 2.0;
-    let cy = m.dp(ROWS_TOP_DP + NOTE_DP);
+    let cy = m.dp(ROWS_TOP_DP + NOTE_DP) + head;
     c.text_center(&f.body, title, cx, cy, m.dp(NOTE_TEXT_DP), p.note);
     let Some(why) = why else { return };
     let lines = widgets::wrap(c, &f.body, why, m.sub_px, m.w as f32 - m.dp(SIDE_DP) * 2.0);

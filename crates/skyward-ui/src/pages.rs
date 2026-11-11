@@ -1,9 +1,10 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    FileOp, FileSort, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Pinned, Place, Rows,
+    Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
-    USB_DRIVE_WANTED, WIPES, installs, starting,
+    USB_DRIVE_WANTED, WIPES, installs, order, starting,
 };
 use crate::canvas::Canvas;
 use crate::color::Rgba;
@@ -81,6 +82,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
         Screen::Files => files(cx),
+        Screen::FileSearch => file_search(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
         Screen::Editor => editor(cx),
@@ -133,6 +135,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::InstallWipe => (["滑动以安装并清除", "滑動以安裝並清除", "Slide to install and wipe"], true),
         Confirm::RunScript => (INSTALL, true),
         Confirm::Merge => (["滑动以合并", "滑動以合併", "Slide to merge"], true),
+        Confirm::DeleteDownload => (["滑动以删除下载包", "滑動以刪除下載檔", "Slide to delete the package"], true),
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
         Confirm::SwitchSystem => (["滑动以切换并重启", "滑動以切換並重新啟動", "Slide to switch and reboot"], false),
         Confirm::RemoveSystem => (["滑动以删除", "滑動以刪除", "Slide to remove"], true),
@@ -385,6 +388,23 @@ pub fn settings(cx: &Ctx) -> Frame {
         "When on, a computer can manage the files in internal storage, once it is decrypted.",
     ]);
     y = widgets::footnote(&mut c, t, f, usb.bottom, note);
+    y = widgets::section(&mut c, t, f, y, l.pick(["进入 recovery 时", "進入 recovery 時", "When recovery starts"]));
+    let auto = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["自动开启 WLAN", "自動開啟 Wi-Fi", "Turn Wi-Fi on"]))
+            .icon(BLUE, Icon::Wlan)
+            .subtitle(l.pick(["并连接上次用过的网络", "並連線上一個用過的網路", "and join the network last used"]))
+            .trail(Trail::Switch(s.auto_wlan)),
+        Row::new(l.pick(["自动解密 data", "自動解密 data", "Decrypt data"]))
+            .icon(BLUE, Icon::Lock)
+            .subtitle(l.pick(["记住锁屏密码，下次自动打开", "記住螢幕鎖定密碼，下次自動開啟", "Keep the screen lock and open it next time"]))
+            .trail(Trail::Switch(s.auto_decrypt)),
+    ]);
+    out.extend(hits(&auto.rows, &[Action::Toggle(Switch::AutoWlan), Action::Toggle(Switch::RememberDecrypt)]));
+    y = widgets::footnote(&mut c, t, f, auto.bottom, l.pick([
+        "WLAN 密码和锁屏密码保存在本机的 recovery 设置中，不会上传。",
+        "Wi-Fi 密碼和螢幕鎖定密碼保存在本機的 recovery 設定中，不會上傳。",
+        "Wi-Fi and screen-lock passwords are kept in this phone's recovery settings and are not uploaded.",
+    ]));
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
     let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
     out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
@@ -2689,6 +2709,18 @@ fn online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
             y = download.bottom;
         }
     }
+    let downloading = s.download.as_ref().is_some_and(|j| j.outcome.is_none());
+    if !downloading && !matches!(s.have, Have::Nothing) {
+        let (label, danger) = confirm_label(Confirm::DeleteDownload, s);
+        let track = widgets::confirm(c, t, f, y + t.m.card_gap, label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::DeleteDownload) });
+        let note = l.pick([
+            "删除后需重新下载完整更新包。",
+            "刪除後需重新下載完整更新檔。",
+            "The package has to be downloaded again after it is deleted.",
+        ]);
+        y = widgets::footnote(c, t, f, track.y + track.h, note);
+    }
     let saved = tr!(
         l,
         "完整更新包将保存到\"/sdcard/{DOWNLOADS}\"中，安装后不会自动删除。",
@@ -3095,7 +3127,56 @@ pub fn files(cx: &Ctx) -> Frame {
     });
     let button = Some((widgets::Glyph::Terminal, Action::TerminalHere));
     let root = l.pick(["根目录", "根目錄", "Root"]);
-    Frame { dock, button, ..listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES)) }
+    Frame { dock, button, ..listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES), Some(Action::OpenFileSearch)) }
+}
+
+/// Finding a file in the folder the file manager shows, as its search bar
+/// opens: the field, what it finds, and the keyboard.
+pub fn file_search(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let m = &t.m;
+    let mut c = page(cx);
+    let mut out = Vec::new();
+    let (at, cancel) = widgets::search_layout(t);
+    let field = widgets::search_field(&mut c, t, f, at.x, at.w, at.y + at.h / 2.0, &s.file_query, l.pick(["搜索文件", "搜尋檔案", "Search files"]));
+    widgets::cancel_button(&mut c, t, cancel);
+    out.push(Hit { rect: cancel, action: Action::Back });
+    let top = field.field.y + field.field.h + m.dp(12.0);
+    let kb_top = m.h as f32 - widgets::keyboard_height(t);
+    let query = s.file_query.trim().to_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    let mut opens: Vec<Action> = Vec::new();
+    let entries = match s.search_place {
+        Some(place) => s.folder(Screen::Choose(place)).entries.as_ref(),
+        None => s.files.entries.as_ref(),
+    };
+    if let Ok(entries) = entries {
+        for i in order(entries, s.file_sort) {
+            let entry = &entries[i];
+            if entry.name.to_lowercase().contains(&query) {
+                names.push(entry.name.clone());
+                opens.push(match s.search_place {
+                    Some(_) => Action::Found(i),
+                    None => Action::OpenEntry(i),
+                });
+            }
+        }
+    }
+    if names.is_empty() {
+        let none = l.pick(["没有匹配的文件", "沒有符合的檔案", "No files match"]);
+        widgets::list(&mut c, t, f, top, &[Row::new(none).trail(Trail::None)]);
+    } else {
+        let rows: Vec<Row> = names.iter().map(|n| Row::new(n.as_str())).collect();
+        let list = widgets::list(&mut c, t, f, top, &rows);
+        let shown = list.rows.iter().zip(&opens).filter(|(r, _)| r.y + r.h <= kb_top);
+        out.extend(shown.map(|(&rect, action)| Hit { rect, action: *action }));
+    }
+    let find = l.pick(["搜索", "搜尋", "Search"]);
+    keyboard_hits(&mut c, t, f, s, find, &mut out);
+    if let Some(rect) = field.clear {
+        out.push(Hit { rect, action: Action::ClearFileSearch });
+    }
+    Frame { back: false, header: false, caret: Some(field.caret), ..Frame::new(t, c, out, l.pick(["搜索文件", "搜尋檔案", "Search files"]), 0.0) }
 }
 
 const CANCEL: Text = ["取消", "取消", "Cancel"];
@@ -3118,7 +3199,16 @@ pub fn choose(cx: &Ctx, place: Place) -> Frame {
         _ => None,
     };
     let empty = l.pick(["暂无可安装的文件", "沒有可安裝的檔案", "Nothing here to install"]);
-    listing(cx, s.folder(Screen::Choose(place)), place_name(l, place), absent, empty, Action::ChooseEntry, l.pick(["选择文件", "選擇檔案", "Choose a file"]))
+    listing(
+        cx,
+        s.folder(Screen::Choose(place)),
+        place_name(l, place),
+        absent,
+        empty,
+        Action::ChooseEntry,
+        l.pick(["选择文件", "選擇檔案", "Choose a file"]),
+        Some(Action::OpenPlaceSearch(place)),
+    )
 }
 
 /// A folder laid out as the stock file manager lays one out: the path as
@@ -3126,6 +3216,7 @@ pub fn choose(cx: &Ctx, place: Place) -> Frame {
 /// entries in one list on the plain page, each row drawn as it scrolls into
 /// view and touched for `action`. In place of the list, `absent` says why
 /// nothing of the folder can be shown, and `empty` that it holds nothing.
+#[allow(clippy::too_many_arguments)]
 fn listing(
     cx: &Ctx,
     folder: &Folder,
@@ -3134,27 +3225,67 @@ fn listing(
     empty: &str,
     action: fn(usize) -> Action,
     title: &'static str,
+    head: Option<Action>,
 ) -> Frame {
     let (t, f) = (cx.t, cx.f);
     let bg = files::page(t);
     let mut c = sheet(cx, t.m.h, bg);
-    let rows = match (absent, &folder.entries) {
+    let strip = files::strip(t, f, top, &folder.path);
+    let (pinned, head) = match head {
+        Some(search) => {
+            let gap = t.m.dp(files::ROWS_TOP_DP - files::STRIP_TOP_DP);
+            let mut head_hits = Vec::new();
+            let mut canvas = Canvas::new(t.m.w, gap.round() as u32 + (t.m.search_h + t.m.dp(12.0)).round() as u32);
+            canvas.clear(bg);
+            canvas.lay(&strip.canvas, 0, 0, 1.0);
+            let head = files_head(cx, &mut canvas, gap, &mut head_hits, search);
+            let mut hits = strip.hits.clone();
+            hits.extend(head_hits);
+            (Some(Pinned { canvas, top: strip.top, hits }), head)
+        }
+        None => (Some(strip), 0.0),
+    };
+    let listed = folder.entries.clone();
+    let rows = match (absent, &listed) {
         (Some((note, why)), _) => {
-            files::note(&mut c, t, f, note, Some(why));
+            files::note(&mut c, t, f, note, Some(why), head);
             None
         }
         (None, Err(why)) => {
-            files::note(&mut c, t, f, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            files::note(&mut c, t, f, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why), head);
             None
         }
         (None, Ok(entries)) if entries.is_empty() => {
-            files::note(&mut c, t, f, empty, None);
+            files::note(&mut c, t, f, empty, None, head);
             None
         }
-        (None, Ok(entries)) => Some(files::rows(t, f, entries, action)),
+        (None, Ok(entries)) => Some(files::rows(t, f, entries, action, head)),
     };
-    let pinned = Some(files::strip(t, f, top, &folder.path));
     Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), title, t.m.dp(files::STRIP_TOP_DP)) }
+}
+
+/// The file manager's search bar and the button that changes how the folder
+/// is ordered, laid at `top`, each answering a touch; gives how much room
+/// they take.
+fn files_head(cx: &Ctx, c: &mut Canvas, top: f32, out: &mut Vec<Hit>, search: Action) -> f32 {
+    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+    let m = &t.m;
+    let gap = m.dp(8.0);
+    let sort_w = m.dp(86.0);
+    let field = Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0 - sort_w - gap, m.search_h);
+    widgets::search_capsule(c, t, f, field, l.pick(["搜索文件", "搜尋檔案", "Search files"]));
+    out.push(Hit { rect: field, action: search });
+    let sort = Rect::new(field.x + field.w + gap, top, sort_w, m.search_h);
+    c.fill_round_rect(sort.x, sort.y, sort.w, sort.h, sort.h / 2.0, t.pal.search);
+    let label = l.pick(match cx.state.file_sort {
+        FileSort::Name => ["名称", "名稱", "Name"],
+        FileSort::Modified => ["时间", "時間", "Time"],
+        FileSort::Type => ["类型", "類型", "Type"],
+        FileSort::Size => ["大小", "大小", "Size"],
+    });
+    c.text_center(&f.value, label, sort.centre().0, sort.centre().1, m.dp(14.0), t.pal.text);
+    out.push(Hit { rect: sort, action: Action::CycleFileSort });
+    m.search_h + m.dp(12.0)
 }
 
 /// Row `i` of the page's long list over the whole of `c`, sized for it,

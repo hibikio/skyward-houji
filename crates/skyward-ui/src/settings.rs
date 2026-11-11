@@ -5,7 +5,8 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SavedWlan, State, SCREEN_OFF, TIME_ZONES};
+use skyward_net::supplicant::Security;
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,47 @@ pub struct Settings {
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
+    /// The WLAN turned on and the network kept at the next start.
+    pub wlan: WlanSettings,
+    /// The data partition opened and its owner's files unlocked at the
+    /// next start, with the credential kept.
+    pub decrypt: DecryptSettings,
+}
+
+/// The WLAN kept from one start to the next.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WlanSettings {
+    /// Turn the WLAN on as the recovery starts, and join the network kept.
+    pub auto: bool,
+    /// The network joined once, kept to join again.
+    pub saved: Option<SavedWlanSettings>,
+}
+
+/// The network kept: its name, how it is protected, and its password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWlanSettings {
+    pub ssid: Vec<u8>,
+    pub name: String,
+    pub security: String,
+    pub password: String,
+}
+
+/// The data partition's credential kept from one start to the next.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecryptSettings {
+    /// Open the partition and unlock the owner's files as the recovery
+    /// starts.
+    pub auto: bool,
+    /// What the owner enters at their screen lock.
+    pub credential: String,
+}
+
+impl Default for WlanSettings {
+    fn default() -> Self {
+        WlanSettings { auto: true, saved: None }
+    }
 }
 
 /// The install page's options.
@@ -138,6 +180,16 @@ impl Settings {
                 verify: state.verify,
             },
             logs: Logs { kinds: names(&state.logs, &LOGS), to: LOG_PLACES[state.logs_to].to_string() },
+            wlan: WlanSettings {
+                auto: state.auto_wlan,
+                saved: state.saved_wlan.as_ref().map(|w| SavedWlanSettings {
+                    ssid: w.ssid.clone(),
+                    name: w.name.clone(),
+                    security: security_name(w.security).to_string(),
+                    password: w.password.clone(),
+                }),
+            },
+            decrypt: DecryptSettings { auto: state.auto_decrypt, credential: state.saved_code.clone().unwrap_or_default() },
         }
     }
 
@@ -198,7 +250,40 @@ impl Settings {
         if let Some(at) = LOG_PLACES.iter().position(|place| *place == self.logs.to) {
             state.logs_to = at;
         }
+        state.auto_wlan = self.wlan.auto;
+        state.saved_wlan = self.wlan.saved.as_ref().and_then(|w| {
+            Some(SavedWlan { ssid: w.ssid.clone(), name: w.name.clone(), security: security_of(&w.security)?, password: w.password.clone() })
+        });
+        state.auto_decrypt = self.decrypt.auto;
+        state.saved_code = (!self.decrypt.credential.is_empty()).then(|| self.decrypt.credential.clone());
     }
+}
+
+/// A protection as the settings file names it.
+fn security_name(s: Security) -> &'static str {
+    match s {
+        Security::Open => "open",
+        Security::Owe => "owe",
+        Security::Wep => "wep",
+        Security::Psk => "psk",
+        Security::Sae => "sae",
+        Security::PskSae => "psk-sae",
+        Security::Enterprise => "enterprise",
+    }
+}
+
+/// A protection read from the settings file, where it names one.
+fn security_of(name: &str) -> Option<Security> {
+    Some(match name {
+        "open" => Security::Open,
+        "owe" => Security::Owe,
+        "wep" => Security::Wep,
+        "psk" => Security::Psk,
+        "sae" => Security::Sae,
+        "psk-sae" => Security::PskSae,
+        "enterprise" => Security::Enterprise,
+        _ => return None,
+    })
 }
 
 /// The names of those of `all` that are `ticked`.
@@ -212,6 +297,7 @@ fn picked<const N: usize>(kept: &[String], all: &[&str; N]) -> [bool; N] {
 }
 
 /// What the settings file held as the recovery started.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kept {
     Settings(Settings),
@@ -338,6 +424,29 @@ mod tests {
         assert!(json.get("language").is_none(), "no language is chosen until one is");
         let never = Settings::of(&State { screen_off: SCREEN_OFF.len() - 1, ..State::default() });
         assert_eq!(never.screen_off, 0, "a screen that stays on");
+    }
+
+    #[test]
+    fn the_wlan_and_the_screen_lock_go_round_through_the_file() {
+        let state = State {
+            auto_wlan: false,
+            saved_wlan: Some(SavedWlan {
+                ssid: b"Skyward".to_vec(),
+                name: "Skyward".into(),
+                security: Security::PskSae,
+                password: "secret12".into(),
+            }),
+            auto_decrypt: true,
+            saved_code: Some("1234".into()),
+            ..State::default()
+        };
+        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
+        let mut back = State::default();
+        kept.apply(&mut back);
+        assert!(!back.auto_wlan);
+        assert_eq!(back.saved_wlan, state.saved_wlan);
+        assert!(back.auto_decrypt);
+        assert_eq!(back.saved_code.as_deref(), Some("1234"));
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub enum Screen {
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
     Files,
+    /// Finding a file in the folder the file manager shows, by name.
+    FileSearch,
     /// One file, and what can be done with it.
     FileInfo,
     /// The permission bits of the entry the file page shows, a switch each.
@@ -158,6 +160,15 @@ pub enum Have {
     Part(u64),
     /// All of it, checked, this many bytes.
     Whole(u64),
+}
+
+/// A network joined once, kept to join again at the next start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedWlan {
+    pub ssid: Vec<u8>,
+    pub name: String,
+    pub security: Security,
+    pub password: String,
 }
 
 /// Downloading the newest system's full package, as the update page shows
@@ -557,6 +568,11 @@ pub enum Switch {
     /// over.
     KeepRecovery,
     Wlan,
+    /// Turn the WLAN on as the recovery starts and join the network kept.
+    AutoWlan,
+    /// Keep the screen-lock credential and open the data partition with it
+    /// at the next start.
+    RememberDecrypt,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
@@ -661,6 +677,29 @@ pub enum BackupRefusal {
     DataReset,
 }
 
+/// How the file manager orders what a folder holds: folders first always,
+/// then by the name, the time it was last changed, its type, or its size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileSort {
+    #[default]
+    Name,
+    Modified,
+    Type,
+    Size,
+}
+
+impl FileSort {
+    /// The sort after this one, as the button in the file manager cycles.
+    fn next(self) -> FileSort {
+        match self {
+            FileSort::Name => FileSort::Modified,
+            FileSort::Modified => FileSort::Type,
+            FileSort::Type => FileSort::Size,
+            FileSort::Size => FileSort::Name,
+        }
+    }
+}
+
 /// An entry of a folder, as the file manager lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRow {
@@ -748,6 +787,44 @@ impl Folder {
         self.left.truncate(kept.unwrap_or(self.left.len()));
         scroll
     }
+}
+
+/// A folder's entries as `sort` orders them: folders first, then by the
+/// name, the time, the type or the size, the name settling every tie.
+pub(crate) fn ordered(entries: &[FileRow], sort: FileSort) -> Vec<FileRow> {
+    let mut out = entries.to_vec();
+    sort_rows(&mut out, sort);
+    out
+}
+
+/// Put a folder's entries in the order `sort` names, folders first.
+pub(crate) fn sort_rows(entries: &mut [FileRow], sort: FileSort) {
+    fn folder(e: &FileRow) -> bool {
+        matches!(e.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. })
+    }
+    fn name(e: &FileRow) -> String {
+        e.name.to_lowercase()
+    }
+    fn extension(e: &FileRow) -> String {
+        std::path::Path::new(&e.name).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default()
+    }
+    entries.sort_by(|a, b| {
+        (!folder(a))
+            .cmp(&(!folder(b)))
+            .then_with(|| match sort {
+                FileSort::Name => std::cmp::Ordering::Equal,
+                FileSort::Modified => b.modified.cmp(&a.modified),
+                FileSort::Type => extension(a).cmp(&extension(b)),
+                FileSort::Size => b.size.cmp(&a.size),
+            })
+            .then_with(|| name(a).cmp(&name(b)))
+    });
+}
+
+/// The places `sort` puts the entries in.
+pub(crate) fn order(entries: &[FileRow], sort: FileSort) -> Vec<usize> {
+    let ordered = ordered(entries, sort);
+    ordered.iter().map(|e| entries.iter().position(|x| x.name == e.name).unwrap_or(0)).collect()
 }
 
 /// Whether a list in a place shows an entry: a folder, or a file the
@@ -865,6 +942,8 @@ pub enum Confirm {
     RunScript,
     /// Merge the update that waits in the slot the phone runs from.
     Merge,
+    /// Delete the full package downloaded for the system update.
+    DeleteDownload,
     /// Give the data partition's files the SELinux labels the installed
     /// system's rules give them.
     Relabel,
@@ -1235,6 +1314,16 @@ pub enum Action {
     ClearSearch,
     /// Leave the search, by the round button beside its field.
     CloseSearch,
+    /// Search the folder the file manager shows.
+    OpenFileSearch,
+    /// Search the folder of `place` a file to install is chosen in.
+    OpenPlaceSearch(Place),
+    /// Open the file the search found at this place in the folder.
+    Found(usize),
+    /// Empty the file manager's search field.
+    ClearFileSearch,
+    /// Order the file manager's folder by the next thing.
+    CycleFileSort,
     /// Open the file manager's entry at this place in the folder: a folder
     /// to look in, a text file to edit, or what can be done with any other.
     OpenEntry(usize),
@@ -1287,6 +1376,8 @@ pub enum Action {
     /// The network chosen: its password again once refused, its details
     /// otherwise.
     OpenJoined,
+    /// Join the network kept from an earlier start.
+    JoinSaved,
     /// Leave the network joined, and forget it.
     LeaveNetwork,
     /// Look for the networks in range again.
@@ -1680,6 +1771,13 @@ pub struct State {
     pub held: Option<Action>,
     /// The folder the file manager shows.
     pub files: Folder,
+    /// What is typed in the file manager's search field.
+    pub file_query: String,
+    /// The place whose folder the file search looks in; the file manager's
+    /// own folder where none is.
+    pub search_place: Option<Place>,
+    /// How the file manager orders what a folder holds.
+    pub file_sort: FileSort,
     /// The folder of internal storage a file to install is chosen in, its
     /// path from the top of the storage.
     pub storage: Folder,
@@ -1727,6 +1825,19 @@ pub struct State {
     /// The WLAN, as the runtime last told it; none on a phone whose WLAN the
     /// recovery does not bring up.
     pub wlan: Option<Wlan>,
+    /// Turn the WLAN on as the recovery starts, and join the network kept.
+    pub auto_wlan: bool,
+    /// The network joined once, kept to join again.
+    pub saved_wlan: Option<SavedWlan>,
+    /// The network being joined, kept once it is.
+    pub pending_wlan: Option<SavedWlan>,
+    /// Open the data partition and unlock the owner's files at the next
+    /// start, with the credential kept.
+    pub auto_decrypt: bool,
+    /// What the owner entered at their screen lock, kept.
+    pub saved_code: Option<String>,
+    /// What was entered and is checked: kept once the secure world takes it.
+    pub pending_code: Option<String>,
     /// The network the password page is for, and what is typed there.
     pub joining: Option<Network>,
     /// The network the details page is of, as it was found.
@@ -1803,6 +1914,9 @@ impl Default for State {
             layer: Layer::Letters,
             held: None,
             files: Folder::new("/"),
+            file_query: String::new(),
+            search_place: None,
+            file_sort: FileSort::Name,
             storage: Folder::new(""),
             usb_drive: None,
             drive: Folder::new(""),
@@ -1823,6 +1937,12 @@ impl Default for State {
             part_work: None,
             update: Standing::None,
             wlan: None,
+            auto_wlan: true,
+            saved_wlan: None,
+            pending_wlan: None,
+            auto_decrypt: false,
+            saved_code: None,
+            pending_code: None,
             joining: None,
             details: None,
             adding: None,
@@ -1852,7 +1972,7 @@ impl State {
     /// a place's to choose a file to install in.
     pub fn folder(&self, screen: Screen) -> &Folder {
         match screen {
-            Screen::Files => &self.files,
+            Screen::Files | Screen::FileSearch => &self.files,
             Screen::Choose(Place::Storage) => &self.storage,
             Screen::Choose(Place::UsbDrive) => &self.drive,
             other => unreachable!("{other:?} lists no folder"),
@@ -1861,7 +1981,7 @@ impl State {
 
     fn folder_mut(&mut self, screen: Screen) -> &mut Folder {
         match screen {
-            Screen::Files => &mut self.files,
+            Screen::Files | Screen::FileSearch => &mut self.files,
             Screen::Choose(Place::Storage) => &mut self.storage,
             Screen::Choose(Place::UsbDrive) => &mut self.drive,
             other => unreachable!("{other:?} lists no folder"),
@@ -2113,6 +2233,8 @@ pub enum Effect {
     /// goes with [`App::download_progress`] and [`App::download_ended`].
     Download(Release),
     StopDownload,
+    /// Delete the full package downloaded for the newest system.
+    DeleteDownloaded,
     /// Ask GitHub for Skyward's newest release, telling what it answered
     /// with [`App::skyward_checked`].
     CheckSkyward,
@@ -3280,6 +3402,9 @@ impl App {
     /// those of `waiting`, the user and the control their screen lock is
     /// answered with, still closed.
     pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>) {
+        if let Some(code) = self.state.pending_code.take() {
+            self.state.saved_code = Some(code);
+        }
         self.state.data = match waiting {
             Some((user, keys)) => Data::Locked { user, keys, checking: false },
             None => Data::Open,
@@ -3587,6 +3712,11 @@ impl App {
         if self.state.wlan.as_ref() == Some(&w) {
             return;
         }
+        if let (Some(joined), Some(pending)) = (&w.joined, &self.state.pending_wlan) {
+            if joined.ssid == pending.ssid && matches!(joined.stage, Joining::Connected(_)) {
+                self.state.saved_wlan = Some(self.state.pending_wlan.take().expect("the network being joined is kept"));
+            }
+        }
         self.state.wlan = Some(w);
         if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
             self.refresh();
@@ -3664,6 +3794,14 @@ impl App {
         job.outcome = Some(end);
         self.state.have = have;
         self.wake(now);
+        self.refresh();
+    }
+
+    /// The downloaded package was deleted: the page offers a download
+    /// afresh.
+    pub fn download_deleted(&mut self) {
+        self.state.have = Have::Nothing;
+        self.state.download = None;
         self.refresh();
     }
 
@@ -4048,6 +4186,10 @@ impl App {
     /// gone back up to shows where it was left, as the stock file manager
     /// does; any other starts from its top.
     fn show_folder(&mut self, screen: Screen, folder: String, files: Result<Vec<FileRow>, String>, listed: i64) {
+        let files = files.map(|mut entries| {
+            sort_rows(&mut entries, self.state.file_sort);
+            entries
+        });
         let left = &self.state.folder(screen).path;
         if folder != *left && self.screen() == screen {
             // Climbing out of a folder, the keys come back to it; any other
@@ -5118,6 +5260,16 @@ impl App {
         vec![Effect::OpenData]
     }
 
+    /// Open the data partition at the next start, as the settings ask: a
+    /// recovery that starts with the owner's lock kept opens it and their
+    /// files without the page being touched.
+    pub fn start_decrypt(&mut self) -> Vec<Effect> {
+        match self.state.data {
+            Data::Closed => self.open_data(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Carry out a tapped control.
     fn act(&mut self, action: Action, now: u64) -> Vec<Effect> {
         let l = self.state.lang;
@@ -5163,6 +5315,21 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            Action::Toggle(Switch::AutoWlan) => {
+                self.state.auto_wlan = !self.state.auto_wlan;
+                self.refresh();
+                if self.state.auto_wlan && self.state.wlan.as_ref().is_some_and(|w| matches!(w.power, Power::Off | Power::Failed(_))) {
+                    return vec![Effect::Wlan(true)];
+                }
+            }
+            Action::Toggle(Switch::RememberDecrypt) => {
+                self.state.auto_decrypt = !self.state.auto_decrypt;
+                if !self.state.auto_decrypt {
+                    self.state.saved_code = None;
+                    self.state.pending_code = None;
+                }
+                self.refresh();
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
@@ -5172,7 +5339,7 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
-                    Switch::Wlan => unreachable!("the WLAN switch is turned above"),
+                    Switch::Wlan | Switch::AutoWlan | Switch::RememberDecrypt => unreachable!("the WLAN and the remembering switches are turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
@@ -5439,6 +5606,41 @@ impl App {
                     return vec![Effect::TermInput(bytes)];
                 }
             }
+            Action::OpenFileSearch => {
+                self.state.file_query.clear();
+                self.state.search_place = None;
+                self.state.layer = Layer::Letters;
+                self.open(Screen::FileSearch);
+                return self.arrive_at(Screen::FileSearch);
+            }
+            Action::OpenPlaceSearch(place) => {
+                self.state.file_query.clear();
+                self.state.search_place = Some(place);
+                self.state.layer = Layer::Letters;
+                self.open(Screen::FileSearch);
+                return self.arrive_at(Screen::FileSearch);
+            }
+            Action::Found(i) => {
+                if let Some(place) = self.state.search_place {
+                    self.open(Screen::Choose(place));
+                    return self.act(Action::ChooseEntry(i), now);
+                }
+                return self.act(Action::OpenEntry(i), now);
+            }
+            Action::ClearFileSearch => {
+                self.state.file_query.clear();
+                self.edits += 1;
+                self.refresh();
+            }
+            Action::CycleFileSort => {
+                self.state.file_sort = self.state.file_sort.next();
+                for folder in [&mut self.state.files, &mut self.state.storage, &mut self.state.drive] {
+                    if let Ok(entries) = &mut folder.entries {
+                        sort_rows(entries, self.state.file_sort);
+                    }
+                }
+                self.refresh();
+            }
             Action::ClearSearch => {
                 self.state.search.clear();
                 self.edits += 1;
@@ -5450,6 +5652,11 @@ impl App {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
                         self.state.files.leave(scroll);
+                        // A folder found by the file search opens in the
+                        // file manager, not on the page that found it.
+                        if self.screen() == Screen::FileSearch {
+                            self.open(Screen::Files);
+                        }
                         return vec![Effect::ReadDir(self.state.files.inside(&entry.name))];
                     }
                     FileKind::File if matches!(files::file_type(&entry.name), FileType::Text | FileType::Code) => {
@@ -5517,6 +5724,12 @@ impl App {
                     }
                     s if s.password() => self.ask_password(network),
                     _ => {
+                        self.state.pending_wlan = Some(SavedWlan {
+                            ssid: network.ssid.clone(),
+                            name: network.name.clone(),
+                            security: network.security,
+                            password: String::new(),
+                        });
                         return vec![Effect::JoinWlan {
                             ssid: network.ssid,
                             name: network.name,
@@ -5551,6 +5764,11 @@ impl App {
                     self.state.details = Some(network);
                     self.open(Screen::WlanNetwork);
                 }
+            }
+            Action::JoinSaved => {
+                let Some(w) = self.state.saved_wlan.clone() else { return Vec::new() };
+                self.state.pending_wlan = Some(w.clone());
+                return vec![Effect::JoinWlan { ssid: w.ssid, name: w.name, security: w.security, password: Secret(w.password) }];
             }
             Action::LeaveNetwork => {
                 let mut fx = self.back(now);
@@ -5685,6 +5903,7 @@ impl App {
     fn typing(&mut self) -> &mut String {
         match self.screen() {
             Screen::Search => &mut self.state.search,
+            Screen::FileSearch => &mut self.state.file_query,
             Screen::Decrypt => &mut self.state.code,
             Screen::Rename => &mut self.state.new_name,
             Screen::WlanPassword => &mut self.state.password,
@@ -5768,6 +5987,9 @@ impl App {
     /// checked, and nothing more is entered until it has been.
     fn unlock(&mut self, code: String) -> Vec<Effect> {
         let Data::Locked { user, keys, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
+        if self.state.auto_decrypt {
+            self.state.pending_code = Some(code.clone());
+        }
         self.state.data = Data::Locked { user, keys, checking: true };
         self.refresh();
         vec![Effect::Unlock { user, code }]
@@ -5876,6 +6098,20 @@ impl App {
                         return self.act(Action::Open(first.screen), now);
                     }
                 }
+                // The first file the search finds opens, as the search
+                // page's first feature does.
+                Screen::FileSearch => {
+                    let entries = match self.state.search_place {
+                        Some(place) => self.state.folder(Screen::Choose(place)).entries.as_ref(),
+                        None => self.state.files.entries.as_ref(),
+                    };
+                    if let Some(entry) = entries.ok().and_then(|entries| {
+                        let query = self.state.file_query.trim().to_lowercase();
+                        entries.iter().position(|e| e.name.to_lowercase().contains(&query))
+                    }) {
+                        return self.act(Action::Found(entry), now);
+                    }
+                }
                 Screen::Decrypt if self.state.code.is_empty() => self.say(l.pick(["请输入锁屏密码", "請輸入螢幕鎖定密碼", "Enter the screen lock"]), now),
                 Screen::Decrypt => {
                     let code = std::mem::take(&mut self.state.code);
@@ -5905,6 +6141,12 @@ impl App {
                         Some(why) => self.say(why, now),
                         None => {
                             let password = Secret(std::mem::take(&mut self.state.password));
+                            self.state.pending_wlan = Some(SavedWlan {
+                                ssid: network.ssid.clone(),
+                                name: network.name.clone(),
+                                security: network.security,
+                                password: password.0.clone(),
+                            });
                             let mut fx = self.back(now);
                             fx.push(Effect::JoinWlan { ssid: network.ssid, name: network.name, security: network.security, password });
                             return fx;
@@ -5938,6 +6180,12 @@ impl App {
                                 true => Secret(std::mem::take(&mut self.state.password)),
                                 false => Secret::default(),
                             };
+                            self.state.pending_wlan = Some(SavedWlan {
+                                ssid: name.clone().into_bytes(),
+                                name: name.clone(),
+                                security,
+                                password: password.0.clone(),
+                            });
                             let mut fx = self.back(now);
                             fx.push(Effect::JoinWlan { ssid: name.clone().into_bytes(), name, security, password });
                             return fx;
@@ -6516,6 +6764,7 @@ impl App {
                     fx.push(Effect::Merge);
                 }
             }
+            Confirm::DeleteDownload => fx.push(Effect::DeleteDownloaded),
             Confirm::DeleteEntry => fx.push(Effect::Delete(self.entry_path())),
             // The partition has to be open; whether its users have unlocked
             // their own files makes no difference.
@@ -8929,7 +9178,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::Open(Screen::Files));
         app.set_files("/".into(), Ok(vec![entry("vendor", folder(12)), entry("init.rc", FileKind::File)]), LISTED);
         app.frame(&f, &i);
-        press(&mut app, Key::VolumeDown, 0);
+        light_on(&mut app, &f, &i, Stop::Hit(Action::OpenEntry(0)));
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::OpenEntry(0))));
         assert!(app.key(Key::Power, 1000).is_empty());
         assert_eq!(app.deadline(1000), Some(1000 + CHORD_MS), "it waits for volume down first");
@@ -8999,7 +9248,7 @@ mod tests {
         let folders: Vec<FileRow> = (0..300).map(|k| entry(&format!("dir{k:03}"), folder(k))).collect();
         app.set_files("/".into(), Ok(folders.clone()), LISTED);
         app.frame(&f, &i);
-        press(&mut app, Key::VolumeDown, 0);
+        light_on(&mut app, &f, &i, Stop::Hit(Action::OpenEntry(0)));
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::OpenEntry(0))), "the first entry, below the path");
         for _ in 0..40 {
             press(&mut app, Key::VolumeDown, 0);
@@ -9010,6 +9259,7 @@ mod tests {
         assert!(app.shows(&row, app.top().1), "scrolled into view");
         assert_eq!(press(&mut app, Key::Power, 5000), vec![Effect::ReadDir("/dir040".into())]);
         app.set_files("/dir040".into(), Ok(vec![entry("a", FileKind::File)]), LISTED);
+        light_on(&mut app, &f, &i, Stop::Hit(Action::OpenEntry(0)));
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::OpenEntry(0))), "a folder opened lights its first entry");
         assert_eq!(app.key(Key::Back, 6000), vec![Effect::ReadDir("/".into())]);
         app.set_files("/".into(), Ok(folders), LISTED);
@@ -9864,6 +10114,75 @@ mod tests {
     }
 
     #[test]
+    fn the_file_manager_orders_a_folder_by_name_time_type_or_size() {
+        let mut older = entry("b.txt", FileKind::File);
+        older.modified = 10;
+        older.size = 300;
+        let mut newer = entry("a.img", FileKind::File);
+        newer.modified = 20;
+        newer.size = 100;
+        let dir = entry("z", folder(1));
+        let entries = [older, newer, dir];
+        let names = |sort| ordered(&entries, sort).into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names(FileSort::Name), ["z", "a.img", "b.txt"]);
+        assert_eq!(names(FileSort::Modified), ["z", "a.img", "b.txt"], "the newest first");
+        assert_eq!(names(FileSort::Type), ["z", "a.img", "b.txt"], "by extension, the name settling equal ones");
+        assert_eq!(names(FileSort::Size), ["z", "b.txt", "a.img"], "the largest first");
+    }
+
+    #[test]
+    fn a_place_offers_the_same_search_and_sort() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Install, W, H, PPD);
+        app.state.data = Data::Open;
+        let page = Screen::Choose(Place::Storage);
+        tap(&mut app, &f, &i, Action::Open(page));
+        app.set_place(
+            Place::Storage,
+            "Download".into(),
+            Ok(vec![entry("boot.img", FileKind::File), entry("a.zip", FileKind::File)]),
+            LISTED,
+        );
+        let frame = app.frame(&f, &i);
+        let pinned = frame.pinned.as_ref().expect("a path and its controls");
+        assert!(pinned.hits.iter().any(|h| h.action == Action::OpenPlaceSearch(Place::Storage)));
+        assert!(pinned.hits.iter().any(|h| h.action == Action::CycleFileSort));
+        assert_eq!(tap(&mut app, &f, &i, Action::CycleFileSort), vec![]);
+        let sorted: Vec<&str> = app.state.storage.entries.as_ref().unwrap().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(sorted, ["a.zip", "boot.img"], "time, type and size come after the name");
+        assert_eq!(tap(&mut app, &f, &i, Action::OpenPlaceSearch(Place::Storage)), vec![]);
+        assert_eq!(app.screen(), Screen::FileSearch);
+        type_text(&mut app, &f, &i, "img");
+        let found: Vec<Action> = app.frame(&f, &i).hits.iter().map(|h| h.action).collect();
+        assert!(found.contains(&Action::Found(1)), "the image in the folder: {found:?}");
+        assert_eq!(app.key(Key::Back, 0), vec![]);
+        assert_eq!(app.screen(), page);
+    }
+
+    #[test]
+    fn the_file_manager_finds_a_file_by_name() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files(
+            "/Download".into(),
+            Ok(vec![entry("a.zip", FileKind::File), entry("b.img", FileKind::File), entry("notes.txt", FileKind::File)]),
+            LISTED,
+        );
+        assert_eq!(tap(&mut app, &f, &i, Action::OpenFileSearch), vec![]);
+        assert_eq!(app.screen(), Screen::FileSearch);
+        type_text(&mut app, &f, &i, "img");
+        assert_eq!(app.state.file_query, "img");
+        let hits: Vec<Action> = app.frame(&f, &i).hits.iter().map(|h| h.action).collect();
+        assert!(hits.contains(&Action::OpenEntry(1)), "the only file whose name holds img: {hits:?}");
+        assert!(tap(&mut app, &f, &i, Action::ClearFileSearch).is_empty());
+        assert_eq!(app.state.file_query, "");
+        assert_eq!(app.key(Key::Back, 0), vec![], "back leaves the search for the folder");
+        assert_eq!(app.screen(), Screen::Files);
+        tap(&mut app, &f, &i, Action::OpenFileSearch);
+        assert_eq!(app.screen(), Screen::FileSearch, "and the bar opens it again");
+    }
+
+    #[test]
     fn search_finds_by_pinyin_typed_on_its_own_keyboard() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Search, &f, &i);
@@ -10014,6 +10333,42 @@ mod tests {
     }
 
     #[test]
+    fn the_network_joined_is_kept_and_joined_again() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Wlan, W, H, PPD);
+        app.state.wlan = Some(Wlan::default());
+        let kept = SavedWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::PskSae, password: "secret12".into() };
+        app.state.pending_wlan = Some(kept.clone());
+        app.set_wlan(connected("Skyward"));
+        assert_eq!(app.state.saved_wlan, Some(kept.clone()), "the password is kept once the network is on");
+        app.state.wlan = Some(Wlan { power: Power::On, ..Wlan::default() });
+        assert_eq!(
+            app.act(Action::JoinSaved, 0),
+            vec![Effect::JoinWlan {
+                ssid: b"Skyward".to_vec(),
+                name: "Skyward".into(),
+                security: Security::PskSae,
+                password: Secret("secret12".into()),
+            }],
+            "the next start joins it"
+        );
+        let _ = (f, i);
+    }
+
+    #[test]
+    fn the_screen_lock_kept_opens_the_data_partition() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.auto_decrypt = true;
+        app.state.pending_code = Some("1234".into());
+        app.data_waiting(None);
+        assert_eq!(app.state.saved_code.as_deref(), Some("1234"), "the credential is kept once the secure world takes it");
+        assert_eq!(app.state.data, Data::Open);
+        app.state.data = Data::Closed;
+        assert_eq!(app.start_decrypt(), vec![Effect::OpenData], "a start opens the partition without the page");
+        assert_eq!(app.state.data, Data::Opening);
+    }
+
+    #[test]
     fn the_file_manager_walks_folders_and_back_up_to_the_root() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);
@@ -10026,9 +10381,9 @@ mod tests {
         assert_eq!(app.key(Key::Back, 0), vec![Effect::ReadDir("/".into())], "back climbs a folder");
         assert_eq!(app.screen(), Screen::Files);
         app.set_files("/".into(), Ok(vec![entry("vmlinux", FileKind::File), entry("init.rc", FileKind::File)]), LISTED);
-        assert_eq!(tap(&mut app, &f, &i, Action::OpenEntry(1)), vec![Effect::OpenText("/init.rc".into())], "a text file opens to edit");
+        assert_eq!(tap(&mut app, &f, &i, Action::OpenEntry(0)), vec![Effect::OpenText("/init.rc".into())], "a text file opens to edit");
         assert_eq!(app.screen(), Screen::Files);
-        tap(&mut app, &f, &i, Action::OpenEntry(0));
+        tap(&mut app, &f, &i, Action::OpenEntry(1));
         assert_eq!(app.screen(), Screen::FileInfo);
         assert_eq!(app.state.file.as_ref().map(|e| e.name.as_str()), Some("vmlinux"));
         app.key(Key::Back, 0);
@@ -10059,7 +10414,7 @@ mod tests {
         ];
         app.set_place(Place::Storage, String::new(), Ok(listed), LISTED);
         let shown: Vec<&str> = app.state.storage.entries.as_ref().expect("listed").iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(shown, ["Download", "OTA.ZIP", "boot.img"], "folders and what can be installed, hidden ones left out");
+        assert_eq!(shown, ["Download", "boot.img", "OTA.ZIP"], "folders and what can be installed, hidden ones left out, sorted by name");
         assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::ReadPlace(Place::Storage, "Download".into())]);
         app.set_place(Place::Storage, "Download".into(), Ok(vec![entry("ota.zip", FileKind::File)]), LISTED);
         assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::InstallFile(Place::Storage, "Download/ota.zip".into())]);
@@ -10921,6 +11276,24 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Update)), vec![Effect::ReadUpdate, Effect::CheckUpdate], "a failed check is tried again");
     }
 
+    #[test]
+    fn the_downloaded_package_can_be_deleted_once_it_is_paused() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Update, W, H, PPD);
+        app.state.update_server = true;
+        app.state.data = Data::Open;
+        let release = newest();
+        app.state.check = Check::Answered(Some(release));
+        app.state.have = Have::Part(1_000_000);
+        app.state.download = Some(DownloadJob { progress: None, rate: 0, outcome: Some(DownloadEnd::Stopped), stopping: false });
+        app.refresh();
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteDownload), vec![Effect::DeleteDownloaded]);
+        app.download_deleted();
+        assert_eq!(app.state.have, Have::Nothing);
+        assert!(app.state.download.is_none());
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::DeleteDownload)), "nothing left to delete");
+    }
+
     fn skyward_newest(newer: bool) -> Newest {
         Newest {
             version: "0.1.4".into(),
@@ -11089,7 +11462,13 @@ mod tests {
         let mut app = App::new(Screen::Files, W, H, PPD);
         app.set_files("/data".into(), Err("read /data: Permission denied (os error 13)".into()), LISTED);
         let fr = app.frame(&f, &i);
-        assert!(fr.hits.is_empty() && fr.rows.is_none());
+        assert!(fr.rows.is_none());
+        let pinned = fr.pinned.as_ref().expect("the path and the search bar are there");
+        assert_eq!(
+            pinned.hits.iter().map(|h| h.action).collect::<Vec<_>>().as_slice()[1..],
+            [Action::OpenFileSearch, Action::CycleFileSort],
+            "only the path and the search and sort controls"
+        );
     }
 
     #[test]
