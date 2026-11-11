@@ -15,6 +15,7 @@ mod android {
 
     const GET_FREE: u32 = 0x4C82;
     const CONFIGURE: u32 = 0x4C0A;
+    const CLR_FD: u32 = 0x4C01;
 
     /// The device only ever reads. It stays pointed at the file until the
     /// recovery ends, which is as long as anything mounted from it lasts.
@@ -72,6 +73,41 @@ mod android {
             return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
         }
         Ok(path)
+    }
+
+    /// The files the kernel has pointed loop devices at, each with the
+    /// device it is shown as.
+    pub fn devices() -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir("/dev/block").context("read /dev/block")? {
+            let path = entry.context("read /dev/block")?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if name.strip_prefix("loop").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The file `device` is pointed at, where the kernel says.
+    pub fn backing(device: &Path) -> Option<PathBuf> {
+        let name = device.file_name()?.to_str()?;
+        let text = std::fs::read_to_string(format!("/sys/block/{name}/loop/backing_file")).ok()?;
+        Some(PathBuf::from(text.trim_end_matches('\n')))
+    }
+
+    /// Let go of the file a loop device is pointed at: once nothing is
+    /// mounted from the device, it goes away.
+    pub fn detach(device: &Path) -> Result<()> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(device)
+            .with_context(|| format!("open {}", device.display()))?;
+        if unsafe { libc::ioctl(file.as_raw_fd(), CLR_FD as libc::Ioctl, 0 as libc::c_ulong) } < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("let {} go", device.display()));
+        }
+        Ok(())
     }
 
     /// Where the kernel put the loop device it just handed out: Android

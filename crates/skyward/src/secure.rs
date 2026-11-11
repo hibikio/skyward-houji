@@ -162,6 +162,30 @@ pub fn libraries() -> Result<Option<PathBuf>> {
     Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
 }
 
+/// Let go of the bundles opened from the installed system's partitions,
+/// and of the loop devices pointed into them, before those partitions are
+/// written over. A bundle mounted from a file on a partition keeps that
+/// partition busy even after nothing reads it; the libraries the phone's
+/// own programs already mapped stay in memory.
+pub fn release_libraries() -> Result<usize> {
+    let mut released = 0;
+    for device in skyward_block::loopdev::devices()? {
+        let Some(backing) = skyward_block::loopdev::backing(&device) else { continue };
+        if !backing.starts_with("/mnt/") {
+            continue;
+        }
+        if let Some(name) = backing.file_stem().and_then(|n| n.to_str()) {
+            let at = Path::new(BUNDLE_MOUNT).join(name);
+            if skyward_block::mount::is_mount_point(&at)? {
+                skyward_block::mount::umount(&at).with_context(|| format!("unmount {}", at.display()))?;
+            }
+        }
+        skyward_block::loopdev::detach(&device).with_context(|| format!("let {} go", device.display()))?;
+        released += 1;
+    }
+    Ok(released)
+}
+
 /// Open the bundle of this name where it lies, and give where it is. A
 /// bundle the phone does not carry gives nothing; one already open is left
 /// as it is.
@@ -173,8 +197,14 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
         return Ok(None);
     };
-    let (offset, length) = image(&file)?;
-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
+    // Opened where it lies, a bundle holds the partition it is on busy
+    // for as long as it is mounted, and an install cannot take that
+    // partition off before writing over it. It is copied to the ramdisk
+    // first, which has room for the few bundles a phone carries.
+    let copy = Path::new("/tmp").join(format!("{name}.apex"));
+    fs::copy(&file, &copy).with_context(|| format!("copy {} to {}", file.display(), copy.display()))?;
+    let (offset, length) = image(&copy)?;
+    let device = skyward_block::loopdev::attach(&copy, offset, length)?;
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
     Ok(Some(at))

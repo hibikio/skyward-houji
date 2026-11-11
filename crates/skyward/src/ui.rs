@@ -970,6 +970,12 @@ fn detach(services: Vec<Service>) -> Detach {
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
         let mounted = skyward_vab::mounted_partitions(slot)?;
         let busy = services::pin(&services, &mounted)?;
+        // The vendor interface's bundle is opened from a file on one of
+        // those partitions, and keeps it busy until the loop device is let
+        // go; the libraries already mapped stay in memory.
+        if crate::secure::release_libraries()? > 0 {
+            let _ = skyward_sys::kmsg("install: let go of the library bundles opened from the installed system");
+        }
         skyward_vab::release_partitions(slot, &busy)
     })
 }

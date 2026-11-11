@@ -410,7 +410,15 @@ impl<L: Link> Connection<L> {
         loop {
             let p = match self.receive() {
                 Ok(p) => p,
-                Err(Error::Io(e)) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                Err(Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // The computer's adb came and went, which a recovery
+                    // waiting for it takes as the cable being out: wait
+                    // for it to come back rather than fail the install.
                     self.inbox.clear();
                     self.stream = None;
                     continue;
