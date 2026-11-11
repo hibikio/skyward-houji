@@ -390,6 +390,41 @@ pub struct Service {
     /// names it: it keeps these alone, through its change of user.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The sockets the phone's own init makes for the program before it
+    /// starts, which it finds by the names init gives them.
+    #[serde(default)]
+    pub sockets: Vec<Socket>,
+    /// Variables the program is started with beyond the ones every
+    /// program gets, as init's environment lines give it.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+}
+
+/// A socket a program finds ready when it starts, as init's socket lines
+/// make them: a listening socket under /dev/socket, passed on as the file
+/// descriptor the variable named after it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Socket {
+    /// Its name, which is also its file's name under /dev/socket, and the
+    /// rest of the variable the program reads its descriptor from.
+    pub name: String,
+    /// Whether it carries datagrams rather than a stream of bytes.
+    #[serde(default)]
+    pub datagram: bool,
+    /// The mode its file is given, as an octal number.
+    #[serde(default = "default_socket_mode")]
+    pub mode: u32,
+    /// The user who owns its file; the program's own user by default.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// The group that owns its file; the program's own group by default.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// What init gives a socket's file when its line names no mode.
+fn default_socket_mode() -> u32 {
+    0o660
 }
 
 /// The kernel's capabilities, by the names init's capabilities lines give
@@ -524,8 +559,8 @@ impl DeviceConfig {
         for s in cfg.services.iter().filter(|s| s.oneshot) {
             let waits = s.ready_property.is_some() || s.ready_service.is_some() || s.ready_hardware_service.is_some();
             ensure!(
-                !waits && s.registers.is_empty() && s.description.is_none(),
-                "[[service]] {}: a program run once is ready when it ends, and registers nothing",
+                !waits && s.registers.is_empty() && s.description.is_none() && s.sockets.is_empty(),
+                "[[service]] {}: a program run once is ready when it ends, registers nothing and is given no socket",
                 s.path
             );
         }
@@ -536,6 +571,31 @@ impl DeviceConfig {
             }
             for name in &s.capabilities {
                 ensure!(capability(name).is_some(), "[[service]] {}: {name} is not a capability init knows", s.path);
+            }
+            for socket in &s.sockets {
+                ensure!(
+                    !socket.name.is_empty()
+                        && !socket.name.contains('/')
+                        && !socket.name.contains(char::is_whitespace),
+                    "[[service]] {}: {:?} is not a socket's name",
+                    s.path,
+                    socket.name
+                );
+                ensure!(socket.mode <= 0o7777, "[[service]] {}: socket {} has {:o}, which is not a file's mode", s.path, socket.name, socket.mode);
+                for name in socket.user.iter().chain(&socket.group) {
+                    ensure!(
+                        !name.is_empty() && !name.contains(char::is_whitespace),
+                        "[[service]] {}: {name:?} is not an account's name",
+                        s.path
+                    );
+                }
+            }
+            for (name, value) in &s.environment {
+                ensure!(
+                    !name.is_empty() && !name.contains('=') && !name.contains('\0') && !value.contains('\0'),
+                    "[[service]] {}: {name:?} is not a variable a program can be given",
+                    s.path
+                );
             }
         }
         for folder in &cfg.backup.data_skipped {
@@ -934,6 +994,50 @@ mod tests {
         assert_eq!(cfg.services[6].ready_hardware_service.as_deref(), Some("android.hardware.boot@1.2::IBootControl/default"));
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
         assert!(cfg.backup.data_skipped.contains(&"vendor/tzstorage".to_string()));
+    }
+
+    #[test]
+    fn parses_houji() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/houji.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "houji");
+        assert_eq!(cfg.firmware.as_ref().map(|f| f.partition.as_str()), Some("modem"), "the secure world and WLAN firmware are on the modem");
+        assert_eq!(cfg.partitions.mounted, ["persist"], "the secure world and the WLAN's address are there");
+        let service = |path: &str| {
+            cfg.services.iter().find(|s| s.path == path).unwrap_or_else(|| panic!("{path} is not started"))
+        };
+        let qseecomd = service("/vendor/bin/qseecomd");
+        assert_eq!(qseecomd.ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+        assert_eq!(qseecomd.sockets.len(), 1);
+        assert_eq!(qseecomd.sockets[0].name, "notify-topology");
+        assert_eq!(qseecomd.sockets[0].group.as_deref(), Some("drmrpc"));
+        let ssgtzd = service("/vendor/bin/ssgtzd");
+        let sockets: Vec<&str> = ssgtzd.sockets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(sockets, ["ssgtzd", "ssgtzd_opener"]);
+        let keymint = service("/vendor/bin/hw/android.hardware.security.keymint-service-qti");
+        assert_eq!(
+            keymint.ready_service.as_deref(),
+            Some("android.hardware.security.keymint.IKeyMintDevice/default")
+        );
+        assert_eq!(keymint.environment.get("LD_CONFIG_FILE").map(String::as_str), Some("/kmlibs/ld.config.txt"));
+        assert_eq!(keymint.registers.len(), 3, "the other three names the key service registers");
+        let gatekeeper = service("/vendor/bin/hw/android.hardware.gatekeeper-service-qti");
+        assert_eq!(gatekeeper.ready_service.as_deref(), Some("android.hardware.gatekeeper.IGatekeeper/default"));
+        assert_eq!(gatekeeper.description.as_deref(), Some("/vendor/etc/vintf/manifest_pineapple.xml"));
+        let wlan = cfg.wlan.expect("the 14's WLAN is described");
+        assert_eq!(wlan.firmware[1].path, "/mnt/vendor/persist/wlan/wlan_mac.bin");
+        assert_eq!(wlan.modules, ["rfkill", "qca_cld3_kiwi_v2"]);
+    }
+
+    #[test]
+    fn a_socket_is_named_plainly_and_given_a_mode() {
+        let base = "[device]\ncodename = \"x\"\n[[service]]\npath = \"/s\"\n";
+        let with = |sockets: &str| DeviceConfig::parse(&format!("{base}sockets = [{sockets}]\n"));
+        let cfg = with("{ name = \"a\" }").unwrap();
+        assert_eq!((cfg.services[0].sockets[0].mode, cfg.services[0].sockets[0].datagram), (0o660, false));
+        assert!(with("{ name = \"a\", datagram = true, mode = 0o644, user = \"system\", group = \"drmrpc\" }").is_ok());
+        assert!(with("{ name = \"a/b\" }").is_err());
+        assert!(with("{ name = \"\" }").is_err());
+        assert!(with("{ name = \"a\", mode = 0o10000 }").is_err());
     }
 
     #[test]

@@ -6,10 +6,12 @@ use skyward_vab::Mounted;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,10 @@ const CAP_LAST_CAP: &str = "/proc/sys/kernel/cap_last_cap";
 
 /// The version of the kernel's capability sets that holds 64 of them.
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// Where the phone's own init puts the sockets it makes for a program, and
+/// where a program that asks for one by name finds it.
+const SOCKET_FOLDER: &str = "/dev/socket";
 
 /// Keep each program running, one thread per program: start it, and start
 /// it again whenever it exits. They are started in the order they are
@@ -50,14 +56,15 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         }
         let who = Credentials::of(&s, &known)?;
         if s.oneshot {
-            let status = command(&s, &who).status().with_context(|| format!("run {}", s.path))?;
+            let status = command(&s, &who, &[]).status().with_context(|| format!("run {}", s.path))?;
             ensure!(status.success(), "{} {} ended: {status}", s.path, s.args.join(" "));
             skyward_sys::kmsg(&format!("ran {} {}", s.path, s.args.join(" ")))?;
             continue;
         }
         let waiting = s.clone();
+        let known = known.clone();
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
-        thread::Builder::new().name(name).spawn(move || supervise(&s, &who)).context("start a supervising thread")?;
+        thread::Builder::new().name(name).spawn(move || supervise(&s, &who, &known)).context("start a supervising thread")?;
         ready(&waiting)?;
     }
     Ok(())
@@ -189,12 +196,90 @@ fn ready(s: &Service) -> Result<()> {
     }
 }
 
-fn supervise(s: &Service, who: &Credentials) -> ! {
+/// A socket made for a program before it starts, and the name it finds it
+/// by.
+struct NamedSocket {
+    name: String,
+    fd: OwnedFd,
+}
+
+/// Make the sockets `s` asks for, as init makes them before it starts a
+/// program: a listening socket at /dev/socket, owned and opened as the
+/// configuration says, kept here so the file outlives each exec of the
+/// program.
+fn make_sockets(s: &Service, known: &HashMap<String, u32>, who: &Credentials) -> Result<Vec<NamedSocket>> {
+    if s.sockets.is_empty() {
+        return Ok(Vec::new());
+    }
+    fs::create_dir_all(SOCKET_FOLDER).with_context(|| format!("make {SOCKET_FOLDER}"))?;
+    fs::set_permissions(SOCKET_FOLDER, PermissionsExt::from_mode(0o755)).with_context(|| format!("open {SOCKET_FOLDER} to every user"))?;
+    let mut made = Vec::new();
+    for socket in &s.sockets {
+        let path = Path::new(SOCKET_FOLDER).join(&socket.name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("take away {}", path.display())),
+        }
+        let kind = if socket.datagram { libc::SOCK_DGRAM } else { libc::SOCK_STREAM };
+        let fd = unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("make the socket {}", socket.name));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= address.sun_path.len() {
+            bail!("{} is too long a name for a socket", path.display());
+        }
+        for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+            *to = *from as libc::c_char;
+        }
+        let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if unsafe { libc::bind(fd.as_raw_fd(), &address as *const libc::sockaddr_un as *const libc::sockaddr, length) } != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("bind {}", path.display()));
+        }
+        if !socket.datagram && unsafe { libc::listen(fd.as_raw_fd(), 4) } != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("listen on {}", path.display()));
+        }
+        let id = |name: &String| ueventd::account(known, name).with_context(|| format!("{}: the phone has no account named {name}", s.path));
+        let uid = socket.user.as_ref().map(id).transpose()?.unwrap_or(who.uid);
+        let gid = socket.group.as_ref().map(id).transpose()?.unwrap_or(who.gid);
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid)).with_context(|| format!("give {} to {uid}:{gid}", path.display()))?;
+        fs::set_permissions(&path, PermissionsExt::from_mode(socket.mode))
+            .with_context(|| format!("give {} the mode {:o}", path.display(), socket.mode))?;
+        made.push(NamedSocket { name: socket.name.clone(), fd });
+    }
+    Ok(made)
+}
+
+/// Keep the descriptor out of the programs after the one it is handed to,
+/// or let that program keep it through its exec.
+fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if on { flags | libc::FD_CLOEXEC } else { flags & !libc::FD_CLOEXEC };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn supervise(s: &Service, who: &Credentials, known: &HashMap<String, u32>) -> ! {
     loop {
         let started = Instant::now();
         let ended = match running(&s.path) {
             Some(pid) => wait_for(pid).map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
-            None => run(s, who),
+            // The sockets are made only once no earlier copy of the
+            // program runs, so one it still holds is never taken away
+            // from under it.
+            None => match make_sockets(s, known, who).with_context(|| format!("make the sockets of {}", s.path)) {
+                Ok(sockets) => run(s, who, &sockets),
+                Err(e) => Err(e),
+            },
         };
         let line = match ended {
             Ok(how) => format!("{}: {how}", s.path),
@@ -208,20 +293,41 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
 }
 
 /// Start the program and wait for it to end.
-fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut child = command(s, who).spawn().with_context(|| format!("start {}", s.path))?;
+fn run(s: &Service, who: &Credentials, sockets: &[NamedSocket]) -> Result<String> {
+    let mut child = spawn(s, who, sockets).with_context(|| format!("start {}", s.path))?;
     let status = child.wait().context("wait for it")?;
     Ok(format!("pid {} ended: {status}", child.id()))
+}
+
+/// Start the program with the sockets it was promised, which it finds by
+/// the file descriptors the variables named after them hold. The
+/// descriptors stay in this process for as long as the program runs, and
+/// the one it gets is a copy that outlives the exec.
+fn spawn(s: &Service, who: &Credentials, sockets: &[NamedSocket]) -> io::Result<Child> {
+    for socket in sockets {
+        set_cloexec(socket.fd.as_raw_fd(), false)?;
+    }
+    let child = command(s, who, sockets).spawn();
+    for socket in sockets {
+        let _ = set_cloexec(socket.fd.as_raw_fd(), true);
+    }
+    child
 }
 
 /// The program as it is started: with what it is given, from the top of the
 /// tree, reading and writing nothing of the recovery's, finding its
 /// libraries where it names them, and as `who`.
-fn command(s: &Service, who: &Credentials) -> Command {
+fn command(s: &Service, who: &Credentials, sockets: &[NamedSocket]) -> Command {
     let mut cmd = Command::new(&s.path);
     cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
+    }
+    for (name, value) in &s.environment {
+        cmd.env(name, value);
+    }
+    for socket in sockets {
+        cmd.env(format!("ANDROID_SOCKET_{}", socket.name), socket.fd.as_raw_fd().to_string());
     }
     let who = who.clone();
     // Only system calls run between the fork and the exec, on what was
