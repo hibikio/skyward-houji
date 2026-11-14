@@ -5,9 +5,10 @@
 
 use crate::description::{Described, Kind};
 use crate::phone::{Happens, Phone};
-use crate::script::{Program, Socket};
+use crate::script::{Program, Socket, SocketKind};
 use anyhow::{bail, ensure, Context, Result};
 use skyward_config::Service;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// The key service, and the packages whose services it serves besides: it
@@ -119,9 +120,25 @@ pub struct Started {
 }
 
 impl From<Service> for Started {
-    /// A program init gives nothing besides what `service` says.
+    /// A program init gives the sockets and the environment `service`
+    /// names, where the configuration names them; the phone's own scripts
+    /// give them when they start it.
     fn from(service: Service) -> Started {
-        Started { service, sockets: Vec::new(), environment: Vec::new(), anew: false }
+        let sockets = service
+            .sockets
+            .iter()
+            .map(|s| Socket {
+                name: s.name.clone(),
+                kind: if s.datagram { SocketKind::Dgram } else { SocketKind::Stream },
+                passcred: false,
+                listen: !s.datagram,
+                mode: s.mode,
+                user: s.user.clone(),
+                group: s.group.clone(),
+            })
+            .collect();
+        let environment = service.environment.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+        Started { service, sockets, environment, anew: false }
     }
 }
 
@@ -397,6 +414,8 @@ fn started(phone: &Phone, program: &Program, ready: Ready, registers: Vec<String
         user: program.user.clone(),
         groups: program.groups.clone(),
         capabilities: program.capabilities.clone().unwrap_or_default(),
+        sockets: Vec::new(),
+        environment: HashMap::new(),
     };
     Started { service, sockets: program.sockets.clone(), environment: program.environment.clone(), anew: false }
 }

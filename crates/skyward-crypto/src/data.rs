@@ -426,14 +426,14 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
     // hardware that may not answer, and its refusal is slow.
     let mut protectors = protectors(user)?;
     protectors.sort_by_key(|p| matches!(p.bound, Bound::Weaver(_)));
-    let mut last = None;
+    let mut failed = Vec::new();
     for protector in &protectors {
         match open_user_files_behind(service, user, protector, credential, owner) {
             Ok(note) => return Ok(note),
-            Err(e) => last = Some(e),
+            Err(e) => failed.push(format!("{}: {e:#}", protector.id)),
         }
     }
-    Err(last.with_context(|| format!("none of user {user}'s {} blobs opened", protectors.len()))?)
+    Err(anyhow::anyhow!("none of user {user}'s {} blobs opened: {}", protectors.len(), failed.join("; ")))
 }
 
 /// [`open_user_files`] for one protector of the user's.

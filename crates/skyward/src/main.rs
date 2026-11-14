@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use skyward_config::{ramdisk, DeviceConfig};
 #[cfg(target_os = "android")]
-use skyward_programs::secure::Started;
+use skyward_programs::secure::{Started, Step};
 use skyward_sys::{bcb, Power};
 use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
@@ -559,6 +559,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     // anything registers with it, so both are told of the configuration's
     // programs and of those that use the phone's keys together.
     let key_programs = found.as_deref().map(keys::programs).unwrap_or_default();
+    // A phone whose configuration starts the key and credential services
+    // itself keeps doing so: its own libraries and sockets are known there,
+    // and the recovery does not start a second copy.
+    let key_programs_manual = cfg
+        .services
+        .iter()
+        .any(|s| s.path.contains("keymint-service") || s.path.contains("gatekeeper-service"));
     let programs = || services.iter().map(|p| &p.service).chain(&key_programs);
     let hardware: Vec<String> = programs().filter_map(|s| s.ready_hardware_service.clone()).collect();
     if !hardware.is_empty() {
@@ -592,11 +599,27 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
     services::start(&services, libraries.as_deref())?;
-    let steps = found.context("make out from the phone's partitions how its keys are used")?;
+    let mut steps = found.context("make out from the phone's partitions how its keys are used")?;
+    // The instances of libhardware and libvndksupport the installed system
+    // was built against sit apart from the recovery's own, and the key and
+    // credential services have to load those to reach the secure world.
+    if Path::new("/kmlibs").is_dir() {
+        for step in &mut steps {
+            if let Step::Start(program) = step {
+                let name = Path::new(&program.service.path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if name.contains("keymint-service") || name.contains("gatekeeper-service") {
+                    program.service.libraries.insert(0, "/kmlibs".into());
+                    program.environment.push(("LD_CONFIG_FILE".into(), "/kmlibs/ld.config.txt".into()));
+                }
+            }
+        }
+    }
     for line in keys::describe(&steps) {
         skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
     }
-    keys::start(&steps)?;
+    if !key_programs_manual {
+        keys::start(&steps)?;
+    }
     agree_on_the_notes_key(&registering)
 }
 

@@ -385,6 +385,35 @@ pub struct Service {
     /// names it: it keeps these alone, through its change of user.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The sockets the phone's own init makes for the program before it
+    /// starts, which it finds by the names init gives them.
+    #[serde(default)]
+    pub sockets: Vec<Socket>,
+    /// Variables the program is started with beyond the ones every
+    /// program gets, as init's environment lines give it.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+}
+
+/// A socket a program finds ready when it starts, as init's socket lines
+/// make them: a listening socket under /dev/socket, passed on as the file
+/// descriptor the variable named after it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Socket {
+    pub name: String,
+    #[serde(default)]
+    pub datagram: bool,
+    #[serde(default = "default_socket_mode")]
+    pub mode: u32,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// What init gives a socket's file when its line names no mode.
+fn default_socket_mode() -> u32 {
+    0o660
 }
 
 /// The kernel's capabilities, by the names init's capabilities lines give
@@ -531,6 +560,31 @@ impl DeviceConfig {
             }
             for name in &s.capabilities {
                 ensure!(capability(name).is_some(), "[[service]] {}: {name} is not a capability init knows", s.path);
+            }
+            for socket in &s.sockets {
+                ensure!(
+                    !socket.name.is_empty()
+                        && !socket.name.contains('/')
+                        && !socket.name.contains(char::is_whitespace),
+                    "[[service]] {}: {:?} is not a socket's name",
+                    s.path,
+                    socket.name
+                );
+                ensure!(socket.mode <= 0o7777, "[[service]] {}: socket {} has {:o}, which is not a file's mode", s.path, socket.name, socket.mode);
+                for name in socket.user.iter().chain(&socket.group) {
+                    ensure!(
+                        !name.is_empty() && !name.contains(char::is_whitespace),
+                        "[[service]] {}: {name:?} is not an account's name",
+                        s.path
+                    );
+                }
+            }
+            for (name, value) in &s.environment {
+                ensure!(
+                    !name.is_empty() && !name.contains('=') && !name.contains('\0') && !value.contains('\0'),
+                    "[[service]] {}: {name:?} is not a variable a program can be given",
+                    s.path
+                );
             }
         }
         for folder in &cfg.backup.data_skipped {

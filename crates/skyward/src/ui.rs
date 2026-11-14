@@ -1212,6 +1212,10 @@ struct Pages<'a> {
     auto_join_tried: bool,
     /// What opens the data partition at this start, once it is open.
     auto_unlock: Option<String>,
+    /// How many times it has been tried, and when it is tried again: the
+    /// phone's key programs take a moment to come up.
+    auto_unlock_tries: u8,
+    auto_unlock_at: Option<Instant>,
     /// Asking the update server, and downloading the full package.
     checker: Option<updates::Worker>,
     downloader: Option<updates::Worker>,
@@ -1423,6 +1427,8 @@ impl<'a> Pages<'a> {
             scanned_at: Instant::now(),
             auto_join_tried: false,
             auto_unlock: None,
+            auto_unlock_tries: 0,
+            auto_unlock_at: None,
             checker: None,
             downloader: None,
             skyward_checker: None,
@@ -1620,6 +1626,7 @@ impl<'a> Pages<'a> {
         self.merge_told(now)?;
         self.systems_told(now)?;
         self.wlan_told()?;
+        self.retry_auto_unlock()?;
         self.keep_settings(now)?;
         self.updates_told(now)?;
         self.skyward_told(now)?;
@@ -2358,6 +2365,30 @@ impl Pages<'_> {
         Ok(())
     }
 
+    /// Try the kept credential again once the key programs have had time
+    /// to come up: the first try may find them still starting.
+    fn retry_auto_unlock(&mut self) -> Result<()> {
+        let Some(code) = self.auto_unlock.clone() else { return Ok(()) };
+        if self.decryptor.is_some() {
+            return Ok(());
+        }
+        let skyward_ui::app::Data::Locked { user, .. } = self.app.state.data else {
+            self.auto_unlock = None;
+            return Ok(());
+        };
+        if self.auto_unlock_tries >= 6 {
+            self.auto_unlock = None;
+            return Ok(());
+        }
+        if self.auto_unlock_at.is_none_or(|at| Instant::now() >= at) {
+            self.auto_unlock_tries += 1;
+            self.auto_unlock_at = Some(Instant::now() + Duration::from_secs(5));
+            let job = decrypt::Job::Unlock { closed: self.closed.clone(), user, credential: code.into_bytes() };
+            self.decryptor = Some(Decryptor::start(job)?);
+        }
+        Ok(())
+    }
+
     /// How opening the data partition, or a user's own files in it, ended.
     fn decrypt_told(&mut self, now: u64) -> Result<()> {
         let Some(ended) = self.decryptor.as_ref().and_then(Decryptor::ended) else { return Ok(()) };
@@ -2389,14 +2420,6 @@ impl Pages<'_> {
                 skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
                 self.app.unlock_failed(why, now);
             }
-        }
-        if self.decryptor.is_none()
-            && let Some(code) = self.auto_unlock.clone()
-            && let skyward_ui::app::Data::Locked { user, .. } = self.app.state.data
-        {
-            self.auto_unlock = None;
-            let job = decrypt::Job::Unlock { closed: self.closed.clone(), user, credential: code.into_bytes() };
-            self.decryptor = Some(Decryptor::start(job)?);
         }
         // Screenshots taken while internal storage was closed go into
         // the gallery's once it opens.
