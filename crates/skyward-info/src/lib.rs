@@ -163,8 +163,14 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
         ram_kib: mem_total(&read("/proc/meminfo")?)?,
         panel: (d.width > 0 && d.height > 0).then_some((d.width, d.height)),
         screen: d.diagonal,
-        os_version: system.get(&cfg.device.os_version_prop),
-        android: system.get("ro.build.version.release"),
+        // The installed system's partitions are not mounted as the pages
+        // come up; the recovery was built from the same system, so its own
+        // properties stand in where the installed ones are not read.
+        os_version: system
+            .get(&cfg.device.os_version_prop)
+            .or_else(|| prop(&cfg.device.os_version_prop))
+            .or_else(|| prop("ro.build.version.incremental")),
+        android: system.get("ro.build.version.release").or_else(|| prop("ro.build.version.release")),
         locale: system.get("ro.product.locale"),
         security_patch: system.get("ro.build.version.security_patch").map(|s| s.parse()).transpose()?,
         kernel: kernel_release()?,
