@@ -160,6 +160,27 @@ mod tests {
     }
 
     #[test]
+    fn the_network_joined_is_kept_and_joined_again() {
+        let mut app = App::new(Screen::Wlan, W, H, PPD);
+        app.state.wlan = Some(Wlan::default());
+        let kept = SavedWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::PskSae, password: "secret12".into() };
+        app.state.pending_wlan = Some(kept.clone());
+        app.set_wlan(connected("Skyward"));
+        assert_eq!(app.state.saved_wlan, Some(kept.clone()), "the password is kept once the network is on");
+        app.state.wlan = Some(Wlan { power: Power::On, ..Wlan::default() });
+        assert_eq!(
+            app.act(Action::JoinSaved, 0),
+            vec![Effect::JoinWlan {
+                ssid: b"Skyward".to_vec(),
+                name: "Skyward".into(),
+                security: Security::PskSae,
+                password: Secret("secret12".into()),
+            }],
+            "the next start joins it"
+        );
+    }
+
+    #[test]
     fn a_refused_password_is_asked_for_again_from_the_networks_row() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);

@@ -163,30 +163,6 @@ pub fn libraries() -> Result<Option<PathBuf>> {
     Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
 }
 
-/// Let go of the bundles opened from the installed system's partitions,
-/// and of the loop devices pointed into them, before those partitions are
-/// written over. A bundle mounted from a file on a partition keeps that
-/// partition busy even after nothing reads it; the libraries the phone's
-/// own programs already mapped stay in memory.
-pub fn release_libraries() -> Result<usize> {
-    let mut released = 0;
-    for device in skyward_block::loopdev::devices()? {
-        let Some(backing) = skyward_block::loopdev::backing(&device) else { continue };
-        if !backing.starts_with("/mnt/") {
-            continue;
-        }
-        if let Some(name) = backing.file_stem().and_then(|n| n.to_str()) {
-            let at = Path::new(BUNDLE_MOUNT).join(name);
-            if skyward_block::mount::is_mount_point(&at)? {
-                skyward_block::mount::umount(&at).with_context(|| format!("unmount {}", at.display()))?;
-            }
-        }
-        skyward_block::loopdev::detach(&device).with_context(|| format!("let {} go", device.display()))?;
-        released += 1;
-    }
-    Ok(released)
-}
-
 /// Open the bundle of this name where it lies, and give where it is. A
 /// bundle the phone does not carry gives nothing; one already open is left
 /// as it is.

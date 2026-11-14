@@ -154,6 +154,23 @@ mod tests {
     }
 
     #[test]
+    fn the_downloaded_package_can_be_deleted_once_it_is_paused() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Update, W, H, PPD);
+        app.state.update_server = true;
+        app.state.data = Data::Open;
+        app.state.check = Check::Answered(Some(newest()));
+        app.state.have = Have::Part(1_000_000);
+        app.state.download = Some(DownloadJob { progress: None, rate: 0, outcome: Some(DownloadEnd::Stopped), stopping: false });
+        app.refresh();
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteDownload), vec![Effect::DeleteDownloaded]);
+        app.download_deleted();
+        assert_eq!(app.state.have, Have::Nothing);
+        assert!(app.state.download.is_none());
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::DeleteDownload)), "nothing left to delete");
+    }
+
+    #[test]
     fn the_update_page_asks_the_server_as_it_opens_once_a_network_is_joined() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);

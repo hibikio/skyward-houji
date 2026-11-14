@@ -410,6 +410,25 @@ mod tests {
     }
 
     #[test]
+    fn the_file_manager_finds_a_file_by_name() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files(
+            "/Download".into(),
+            Ok(vec![entry("a.zip", FileKind::File), entry("b.img", FileKind::File), entry("notes.txt", FileKind::File)]),
+            LISTED,
+        );
+        assert_eq!(tap(&mut app, &f, &i, Action::OpenFileSearch), vec![]);
+        assert_eq!(app.screen(), Screen::FileSearch);
+        type_text(&mut app, &f, &i, "img");
+        assert_eq!(app.state.file_query, "img");
+        let hits: Vec<Action> = app.frame(&f, &i).hits.iter().map(|h| h.action).collect();
+        assert!(hits.contains(&Action::OpenEntry(1)), "the only file whose name holds img: {hits:?}");
+        assert_eq!(app.key(Key::Back, 0), vec![], "back leaves the search for the folder");
+        assert_eq!(app.screen(), Screen::Files);
+    }
+
+    #[test]
     fn a_file_in_internal_storage_is_chosen_once_the_storage_is_open() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
